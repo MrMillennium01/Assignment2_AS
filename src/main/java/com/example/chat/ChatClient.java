@@ -5,42 +5,43 @@ import io.grpc.ManagedChannelBuilder;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Scanner;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public final class ChatClient implements Runnable {
+public final class ChatClient implements Runnable, AutoCloseable {
     private static final Object CONSOLE_LOCK = new Object();
 
     private final String host;
     private final int port;
     private final String username;
     private final ClientRole role;
-    private final List<String> scriptedActions;
-    private final boolean keepAliveAfterScript;
-    private final long keepAliveMillis;
+    private final boolean livePrintIncoming;
+
+    private final List<ChatMessage> inbox = new CopyOnWriteArrayList<>();
+    private final CountDownLatch readyLatch = new CountDownLatch(1);
+    private final CountDownLatch closedLatch = new CountDownLatch(1);
+    private final AtomicBoolean started = new AtomicBoolean(false);
+    private final AtomicBoolean running = new AtomicBoolean(false);
+
+    private ManagedChannel channel;
+    private ChatServiceGrpc.ChatServiceBlockingStub blockingStub;
 
     public ChatClient(String host, int port, String username, ClientRole role) {
-        this(host, port, username, role, List.of(), false, 0L);
+        this(host, port, username, role, true);
     }
 
-    public ChatClient(String host,
-                      int port,
-                      String username,
-                      ClientRole role,
-                      List<String> scriptedActions,
-                      boolean keepAliveAfterScript,
-                      long keepAliveMillis) {
+    public ChatClient(String host, int port, String username, ClientRole role, boolean livePrintIncoming) {
         this.host = host;
         this.port = port;
         this.username = username;
         this.role = role;
-        this.scriptedActions = List.copyOf(scriptedActions);
-        this.keepAliveAfterScript = keepAliveAfterScript;
-        this.keepAliveMillis = keepAliveMillis;
+        this.livePrintIncoming = livePrintIncoming;
     }
 
     public static void main(String[] args) throws InterruptedException {
@@ -50,182 +51,216 @@ public final class ChatClient implements Runnable {
         try (Scanner scanner = new Scanner(System.in)) {
             ClientRole role = promptRole(scanner);
             String username = prompt(scanner, "Enter your username: ");
-            runInteractiveSession(host, port, username, role, scanner);
+
+            try (ChatClient client = new ChatClient(host, port, username, role, true)) {
+                client.start();
+                client.awaitReady();
+
+                if (role == ClientRole.NORMAL) {
+                    runNormalInteractive(scanner, client);
+                } else {
+                    runAdminInteractive(scanner, client);
+                }
+            }
         }
     }
 
     @Override
     public void run() {
-        runScriptedSession();
+        try {
+            start();
+            awaitReady();
+            awaitClosed();
+        } catch (InterruptedException interruptedException) {
+            Thread.currentThread().interrupt();
+        } finally {
+            close();
+        }
     }
 
-    public void runInteractive(Scanner scanner) {
-        runInteractiveSession(host, port, username, role, scanner);
-    }
+    public synchronized void start() {
+        if (started.get()) {
+            return;
+        }
 
-    private static void runInteractiveSession(String host,
-                                              int port,
-                                              String username,
-                                              ClientRole role,
-                                              Scanner scanner) {
-        ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
+        channel = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
                 .build();
-
-        ChatServiceGrpc.ChatServiceBlockingStub blockingStub = ChatServiceGrpc.newBlockingStub(channel);
-        CountDownLatch streamFinished = new CountDownLatch(1);
-        AtomicBoolean running = new AtomicBoolean(true);
-
-        printLine("Connected as " + role.name().toLowerCase(Locale.ROOT) + " client: " + username);
-
+        blockingStub = ChatServiceGrpc.newBlockingStub(channel);
         ChatServiceGrpc.ChatServiceStub asyncStub = ChatServiceGrpc.newStub(channel);
+        running.set(true);
+
         asyncStub.subscribe(JoinRequest.newBuilder()
-                        .setClientName(username)
-                        .setRole(role)
-                        .build(),
+                .setClientName(username)
+                .setRole(role)
+                .build(),
                 new StreamObserver<>() {
                     @Override
                     public void onNext(ChatMessage value) {
-                        printMessage(value);
+                        inbox.add(value);
+                        if (livePrintIncoming) {
+                            printLine(formatMessage(value));
+                        }
                     }
 
                     @Override
                     public void onError(Throwable t) {
-                        printError("Chat stream ended: " + t.getMessage());
                         running.set(false);
-                        streamFinished.countDown();
+                        printError(username + " stream ended: " + t.getMessage());
+                        closedLatch.countDown();
                     }
 
                     @Override
                     public void onCompleted() {
                         running.set(false);
-                        streamFinished.countDown();
+                        closedLatch.countDown();
                     }
                 });
 
-        try {
-            if (role == ClientRole.NORMAL) {
-                runNormalClient(scanner, blockingStub, username, running);
-            } else {
-                runAdminClient(scanner, blockingStub, username, running);
-            }
-        } finally {
-            channel.shutdownNow();
-            try {
-                channel.awaitTermination(5, TimeUnit.SECONDS);
-                streamFinished.await(2, TimeUnit.SECONDS);
-            } catch (InterruptedException interruptedException) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    private void runScriptedSession() {
-        ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
-                .usePlaintext()
-                .build();
-
-        CountDownLatch streamFinished = new CountDownLatch(1);
-        AtomicBoolean running = new AtomicBoolean(true);
-        ChatServiceGrpc.ChatServiceBlockingStub blockingStub = ChatServiceGrpc.newBlockingStub(channel);
-        ChatServiceGrpc.ChatServiceStub asyncStub = ChatServiceGrpc.newStub(channel);
-
+        started.set(true);
+        readyLatch.countDown();
         printLine("Connected as " + role.name().toLowerCase(Locale.ROOT) + " client: " + username);
+    }
 
-        asyncStub.subscribe(JoinRequest.newBuilder()
-                        .setClientName(username)
-                        .setRole(role)
-                        .build(),
-                new StreamObserver<>() {
-                    @Override
-                    public void onNext(ChatMessage value) {
-                        printMessage(value);
-                    }
+    public void awaitReady() throws InterruptedException {
+        readyLatch.await();
+    }
 
-                    @Override
-                    public void onError(Throwable t) {
-                        printError("Chat stream ended: " + t.getMessage());
-                        running.set(false);
-                        streamFinished.countDown();
-                    }
+    public void awaitClosed() throws InterruptedException {
+        closedLatch.await();
+    }
 
-                    @Override
-                    public void onCompleted() {
-                        running.set(false);
-                        streamFinished.countDown();
-                    }
-                });
+    public String username() {
+        return username;
+    }
 
-        try {
-            if (role == ClientRole.NORMAL) {
-                for (String action : scriptedActions) {
-                    if (!running.get()) {
-                        break;
-                    }
+    public ClientRole role() {
+        return role;
+    }
 
-                    if (action.isBlank()) {
-                        continue;
-                    }
+    public List<ChatMessage> inboxSnapshot() {
+        return new ArrayList<>(inbox);
+    }
 
-                    ChatMessage sent = blockingStub.sendMessage(SendMessageRequest.newBuilder()
-                            .setSender(username)
-                            .setRole(ClientRole.NORMAL)
-                            .setText(action)
-                            .build());
-                    printLine("Sent message id " + sent.getId());
-                }
-            } else {
-                for (String action : scriptedActions) {
-                    if (!running.get()) {
-                        break;
-                    }
+    public boolean isRunning() {
+        return running.get();
+    }
 
-                    String trimmed = action.trim();
-                    if (!trimmed.startsWith("/delete ")) {
-                        continue;
-                    }
+    public synchronized ChatMessage sendMessage(String text) {
+        ensureReady();
+        if (role != ClientRole.NORMAL) {
+            throw new IllegalStateException("Only normal clients can send messages");
+        }
 
-                    String messageId = trimmed.substring("/delete ".length()).trim();
-                    if (messageId.isEmpty()) {
-                        continue;
-                    }
+        return blockingStub.sendMessage(SendMessageRequest.newBuilder()
+                .setSender(username)
+                .setRole(ClientRole.NORMAL)
+                .setText(text)
+                .build());
+    }
 
-                    ChatMessage updated = blockingStub.deleteMessage(DeleteMessageRequest.newBuilder()
-                            .setMessageId(messageId)
-                            .setDeletedBy(username)
-                            .setRole(ClientRole.ADMIN)
-                            .build());
-                    printLine("Deleted message id " + updated.getId());
-                }
-            }
+    public synchronized ChatMessage deleteMessage(String messageId) {
+        ensureReady();
+        if (role != ClientRole.ADMIN) {
+            throw new IllegalStateException("Only admin clients can delete messages");
+        }
 
-            if (keepAliveAfterScript) {
-                waitBeforeShutdown(running);
-            }
-        } catch (StatusRuntimeException ex) {
-            printError("Client failed: " + ex.getStatus().getDescription());
-        } finally {
+        return blockingStub.deleteMessage(DeleteMessageRequest.newBuilder()
+                .setMessageId(messageId)
+                .setDeletedBy(username)
+                .setRole(ClientRole.ADMIN)
+                .build());
+    }
+
+    public void printInbox() {
+        List<ChatMessage> snapshot = inboxSnapshot();
+        if (snapshot.isEmpty()) {
+            printLine("[" + username + "] inbox is empty");
+            return;
+        }
+
+        printLine("--- perspective: " + username + " (" + role.name().toLowerCase(Locale.ROOT) + ") ---");
+        for (ChatMessage message : snapshot) {
+            printLine("[" + username + "] " + formatMessage(message));
+        }
+    }
+
+    @Override
+    public synchronized void close() {
+        running.set(false);
+        if (channel != null) {
             channel.shutdownNow();
             try {
                 channel.awaitTermination(5, TimeUnit.SECONDS);
-                streamFinished.await(2, TimeUnit.SECONDS);
             } catch (InterruptedException interruptedException) {
                 Thread.currentThread().interrupt();
             }
         }
+        closedLatch.countDown();
     }
 
-    private void waitBeforeShutdown(AtomicBoolean running) {
-        long remaining = keepAliveMillis;
-        while (running.get() && remaining > 0) {
-            long sleepFor = Math.min(remaining, 250L);
-            try {
-                Thread.sleep(sleepFor);
-            } catch (InterruptedException interruptedException) {
-                Thread.currentThread().interrupt();
-                return;
+    private void ensureReady() {
+        if (!started.get() || blockingStub == null) {
+            throw new IllegalStateException("ChatClient has not been started yet");
+        }
+    }
+
+    private static void runNormalInteractive(Scanner scanner, ChatClient client) {
+        printLine("Type a message and press Enter. Use /quit to leave.");
+
+        while (client.isRunning()) {
+            if (!scanner.hasNextLine()) {
+                break;
             }
-            remaining -= sleepFor;
+
+            String line = scanner.nextLine();
+            if ("/quit".equalsIgnoreCase(line.trim())) {
+                break;
+            }
+
+            if (line.isBlank()) {
+                continue;
+            }
+
+            try {
+                ChatMessage sent = client.sendMessage(line);
+                printLine("Sent message id " + sent.getId());
+            } catch (StatusRuntimeException ex) {
+                printError("Send failed: " + ex.getStatus().getDescription());
+            }
+        }
+    }
+
+    private static void runAdminInteractive(Scanner scanner, ChatClient client) {
+        printLine("Use /delete <messageId> to remove a message, or /quit to leave.");
+
+        while (client.isRunning()) {
+            if (!scanner.hasNextLine()) {
+                break;
+            }
+
+            String line = scanner.nextLine().trim();
+            if ("/quit".equalsIgnoreCase(line)) {
+                break;
+            }
+
+            if (!line.startsWith("/delete ")) {
+                printLine("Admin clients can only delete messages.");
+                continue;
+            }
+
+            String messageId = line.substring("/delete ".length()).trim();
+            if (messageId.isEmpty()) {
+                printLine("Usage: /delete <messageId>");
+                continue;
+            }
+
+            try {
+                ChatMessage updated = client.deleteMessage(messageId);
+                printLine("Deleted message id " + updated.getId());
+            } catch (StatusRuntimeException ex) {
+                printError("Delete failed: " + ex.getStatus().getDescription());
+            }
         }
     }
 
@@ -245,83 +280,6 @@ public final class ChatClient implements Runnable {
         return scanner.nextLine().trim();
     }
 
-    private static void runNormalClient(Scanner scanner,
-                                        ChatServiceGrpc.ChatServiceBlockingStub blockingStub,
-                                        String username,
-                                        AtomicBoolean running) {
-        printLine("Type a message and press Enter. Use /quit to leave.");
-
-        while (running.get()) {
-            if (!scanner.hasNextLine()) {
-                break;
-            }
-
-            String line = scanner.nextLine();
-            if ("/quit".equalsIgnoreCase(line.trim())) {
-                running.set(false);
-                break;
-            }
-
-            if (line.isBlank()) {
-                continue;
-            }
-
-            try {
-                ChatMessage sent = blockingStub.sendMessage(SendMessageRequest.newBuilder()
-                        .setSender(username)
-                        .setRole(ClientRole.NORMAL)
-                        .setText(line)
-                        .build());
-                printLine("Sent message id " + sent.getId());
-            } catch (StatusRuntimeException ex) {
-                printError("Send failed: " + ex.getStatus().getDescription());
-            }
-        }
-    }
-
-    private static void runAdminClient(Scanner scanner,
-                                        ChatServiceGrpc.ChatServiceBlockingStub blockingStub,
-                                        String username,
-                                        AtomicBoolean running) {
-        printLine("Use /delete <messageId> to remove a message, or /quit to leave.");
-
-        while (running.get()) {
-            if (!scanner.hasNextLine()) {
-                break;
-            }
-
-            String line = scanner.nextLine();
-            String trimmed = line.trim();
-
-            if ("/quit".equalsIgnoreCase(trimmed)) {
-                running.set(false);
-                break;
-            }
-
-            if (!trimmed.startsWith("/delete ")) {
-                printLine("Admin clients can only delete messages.");
-                continue;
-            }
-
-            String messageId = trimmed.substring("/delete ".length()).trim();
-            if (messageId.isEmpty()) {
-                printLine("Usage: /delete <messageId>");
-                continue;
-            }
-
-            try {
-                ChatMessage updated = blockingStub.deleteMessage(DeleteMessageRequest.newBuilder()
-                        .setMessageId(messageId)
-                        .setDeletedBy(username)
-                        .setRole(ClientRole.ADMIN)
-                        .build());
-                printLine("Deleted message id " + updated.getId());
-            } catch (StatusRuntimeException ex) {
-                printError("Delete failed: " + ex.getStatus().getDescription());
-            }
-        }
-    }
-
     private static ClientRole parseRole(String value) {
         String normalized = value.trim().toLowerCase(Locale.ROOT);
         return switch (normalized) {
@@ -331,7 +289,7 @@ public final class ChatClient implements Runnable {
         };
     }
 
-    private static void printMessage(ChatMessage message) {
+    private static String formatMessage(ChatMessage message) {
         StringBuilder output = new StringBuilder();
         output.append('[').append(message.getId()).append("] ")
                 .append(message.getSender()).append(": ")
@@ -341,7 +299,7 @@ public final class ChatClient implements Runnable {
             output.append(" [deleted by ").append(message.getDeletedBy()).append(']');
         }
 
-        printLine(output.toString());
+        return output.toString();
     }
 
     private static void printLine(String message) {

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meine Webseite</title>
+</head>
+<body>
+<h1>Willkommen auf meiner Webseite</h1>
+
+<button id="btn" onclick="bewegeButton()">Klick mich!</button>
+
+<script>
+    function bewegeButton() {
+        var btn = document.getElementById("btn");
+        var maxX = window.innerWidth - btn.offsetWidth - 20;
+        var maxY = window.innerHeight - btn.offsetHeight - 20;
+        var zufallX = Math.floor(Math.random() * maxX);
+        var zufallY = Math.floor(Math.random() * maxY);
+        btn.style.position = "absolute";
+        btn.style.left = zufallX + "px";
+        btn.style.top = zufallY + "px";
+    }
+</script>
+</body>
+</html>
